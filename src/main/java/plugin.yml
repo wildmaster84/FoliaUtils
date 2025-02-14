@@ -1,0 +1,8 @@
+name: FoliaUtils
+author: wildmaster84
+api-version: 1.13
+description: "Readds missing features to folia"
+main: me.wild.Main
+version: "1.0.0"
+depend: []
+folia-supported: true
