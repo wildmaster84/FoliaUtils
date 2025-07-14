@@ -3,6 +3,7 @@ package me.wild;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Optional;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Material;
@@ -11,18 +12,21 @@ import org.bukkit.block.BlockFace;
 import org.bukkit.block.BlockState;
 import org.bukkit.block.CommandBlock;
 import org.bukkit.command.BlockCommandSender;
+import org.bukkit.craftbukkit.v1_21_R5.block.CraftBlock;
+import org.bukkit.craftbukkit.v1_21_R5.block.CraftBlockEntityState;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockRedstoneEvent;
 import org.bukkit.event.server.ServerCommandEvent;
+import org.bukkit.metadata.MetadataValue;
 import org.bukkit.plugin.Plugin;
 
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
+import net.minecraft.nbt.NBTTagCompound;
 
 public class CommandBlockManager implements Listener {
 	private Plugin plugin;
 	private HashMap<Block, ScheduledTask> repeatingBlocks = new HashMap<>();
-	private List<Block> failedCondition = new ArrayList<>();
 	private List<Block> poweredBlocks = new ArrayList<>();
 	
 	public CommandBlockManager(Plugin plugin) {
@@ -41,71 +45,68 @@ public class CommandBlockManager implements Listener {
         if (!(state instanceof CommandBlock)) return;
         CommandBlock cb = (CommandBlock) state;
         if (!cb.isPlaced()) return;
-        
+
         if (block.getType() == Material.REPEATING_COMMAND_BLOCK) {
-        	ScheduledTask taskId = Bukkit.getRegionScheduler().runAtFixedRate(
-        			plugin, cb.getLocation(), (task) -> {
-                        if (!cb.isPlaced() || !isBlockPowered(block) || block.isEmpty()) {
-                            repeatingBlocks.remove(block);
-                            task.cancel();
-                            return;
-                        }
-                        processCommandBlock(block, sender);
-                    }, 1L, 1L);
-            repeatingBlocks.put(block, taskId);
-            processChainCommandBlock(block, sender, new ArrayList<>());
+        	Bukkit.getRegionScheduler().runAtFixedRate(plugin, cb.getLocation(), (task) -> {
+        		if (isCommandBlockAlwaysActive(block)) {
+        			if (!cb.isPlaced() || block.isEmpty()) {
+            			repeatingBlocks.remove(block);
+            			task.cancel();
+            			return;
+                	}
+        		} else {
+        			if (!cb.isPlaced() || !isBlockPowered(block) || block.isEmpty()) {
+            			repeatingBlocks.remove(block);
+            			task.cancel();
+            			return;
+                	}
+        		}
+            	// check if command failed and stop firing if so.
+            	boolean status = processCommandBlock(block, event.getCommand());
+            	if (repeatingBlocks.get(block) == null) {
+            		processChainCommandBlock(block, new ArrayList<>(), status);
+            		repeatingBlocks.put(block, task);
+            	}
+            }, 1L, 1L);
         }
         else if (block.getType() == Material.COMMAND_BLOCK ) {
-        	processCommandBlock(block, sender);
-        	processChainCommandBlock(block, sender, new ArrayList<>());
+        	boolean status = processCommandBlock(block, event.getCommand());
+        	processChainCommandBlock(block, new ArrayList<>(), status);
         }
     }
 
     // Processes command block. 
     // This handles firing the command and tracking the failures.
-    private void processCommandBlock(Block block, BlockCommandSender  sender) {
-    	CommandBlock cb = (CommandBlock) block.getState();
-    	if (!cb.getCommand().isEmpty()) {
-    		Bukkit.getRegionScheduler().runDelayed(plugin, cb.getLocation(), (command) -> {
-    			Bukkit.getGlobalRegionScheduler().run(plugin, (task) -> {
-                    boolean status = Bukkit.dispatchCommand(sender.getServer().getConsoleSender(), cb.getCommand());
-                    if (status == false) failedCondition.add(block);
-                });
-    		}, 1L);
-    	}
+	// True -> completed
+	// False -> Command failed
+    private boolean processCommandBlock(Block block, String command) {
+    	List<Block> failedCondition = new ArrayList<>();
+    	Bukkit.getGlobalRegionScheduler().execute(plugin, () -> {
+            boolean status = Bukkit.dispatchCommand(Bukkit.getServer().getConsoleSender(), command);
+            if (status == false) failedCondition.add(block);
+        });
+    	return failedCondition.contains(block);
 	}
     
-    private void processChainCommandBlock(Block block, BlockCommandSender sender, List<Block> history) {
-    	CommandBlock cb = (CommandBlock) block.getState();
-    	Bukkit.getRegionScheduler().runDelayed(plugin, cb.getLocation(), (task) -> {
-    		Block nextBlock =  getNextChainBlock(block, sender);
-    		if (nextBlock == null || history.contains(nextBlock)) {
-    			task.cancel();
-    			return;
-    		}
-    		history.add(nextBlock);
-    		processCommandBlock(nextBlock, sender);
-    		processChainCommandBlock(nextBlock, sender, history);
-        }, 1L);
-    }
-
-	private Block getNextChainBlock(Block block, BlockCommandSender  sender) {
-		Block current = block;
-        Block nextBlock = getNextChainCommandBlock(block);
-        if (nextBlock == null) return null;
+    private void processChainCommandBlock(Block lastBlock, List<Block> history, boolean previousFailed) {
+    	Block current =  getNextChainCommandBlock(lastBlock);
+    	
+    	if (current == null || current.getType() != Material.CHAIN_COMMAND_BLOCK || history.contains(current)) return;
+    	CommandBlock cb = (CommandBlock)current.getState();
+    	 if (!cb.isPlaced()) return;
+    	org.bukkit.block.data.type.CommandBlock data = (org.bukkit.block.data.type.CommandBlock) cb.getBlockData();
+    	String command = (cb.getCommand().isEmpty() ? "" : cb.getCommand().replace("/", ""));
+		if (command.isEmpty()) {
+			return;
+		}
         
-        CommandBlock cb = (CommandBlock) nextBlock.getState();
-        org.bukkit.block.data.type.CommandBlock data = (org.bukkit.block.data.type.CommandBlock) cb.getBlockData();
-        if (!cb.isPlaced()) return null;
-        
-        if (failedCondition.contains(current)) cb.setSuccessCount(0); else  cb.setSuccessCount(1);
-        
-        // If List contains current block and is conditional then fail.
-        if (failedCondition.contains(current) && data.isConditional()) {
-        	failedCondition.remove(current);
-        	return null;
+        if (previousFailed && data.isConditional()) {
+        	return;
         }
-        return nextBlock;
+        
+		history.add(current);
+		boolean status = processCommandBlock(current, command);
+		processChainCommandBlock(current, history, status);
     }
 
     private Block getNextChainCommandBlock(Block block) {
@@ -119,13 +120,17 @@ public class CommandBlockManager implements Listener {
     public void redstoneChanges(BlockRedstoneEvent e) {
         Block block = e.getBlock();
         BlockState state = block.getState();
+        
+        if (state instanceof CommandBlock) Bukkit.getLogger().warning("Power: " + isCommandBlockAlwaysActive(block));
 
         // If powered for the first time, handle normally
         if (e.getNewCurrent() > 0 && isBlockPowered(block) && !poweredBlocks.contains(block)) {
             if (state instanceof CommandBlock && block.getType() != Material.CHAIN_COMMAND_BLOCK)  {
             	poweredBlocks.add(block);
             	CommandBlock cb = (CommandBlock) state;
-            	ServerCommandEvent commandEvent = new ServerCommandEvent(new CommandBlockSender(block), cb.getCommand());
+            	String command = (cb.getCommand().isEmpty() ? "" : cb.getCommand().replace("/", ""));
+            	if (command.isEmpty()) return;
+            	ServerCommandEvent commandEvent = new ServerCommandEvent(new CommandBlockSender(block), command);
             	Bukkit.getPluginManager().callEvent(commandEvent);
             }
         }
@@ -141,7 +146,25 @@ public class CommandBlockManager implements Listener {
     
     public boolean isBlockPowered(Block block) {
     	if (block.isBlockPowered() || 
-    			block.isBlockIndirectlyPowered()) return true;
+    			block.isBlockIndirectlyPowered() || isCommandBlockAlwaysActive(block)) return true;
     	return false;
+    }
+    
+    public boolean isCommandBlockAlwaysActive(Block block) {
+        if (!(block.getState() instanceof CommandBlock)) return false;
+
+        try {
+            // Access the Command Block's NBT Data
+            CraftBlockEntityState<?> craftState = (CraftBlockEntityState<?>) block.getState();
+            NBTTagCompound nbt = craftState.getSnapshotNBT();
+
+            // Read the "auto" tag (1b = Always Active, 0b = Needs Redstone)\
+            Optional<Byte> auto = nbt.c("auto");
+            return auto.get() == 1;
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        return false;
     }
 }

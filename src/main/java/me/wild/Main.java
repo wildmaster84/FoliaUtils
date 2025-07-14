@@ -3,6 +3,7 @@ package me.wild;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.Location;
+import org.bukkit.craftbukkit.v1_21_R5.CraftWorld;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -17,7 +18,6 @@ import java.util.HashMap;
 import java.util.UUID;
 
 public class Main extends JavaPlugin implements Listener {
-	public static long TICKS_PER_COMMAND_BLOCK = 3L;  // 3 Game ticks
     // Store the last known location of each player
 	private HashMap<UUID, Location> playerLocations = new HashMap<>();
 	private HashMap<Chunk, Integer> customSpawns = new HashMap<>();
@@ -33,12 +33,13 @@ public class Main extends JavaPlugin implements Listener {
    
     @EventHandler
     public void onCreatureSpawn(CreatureSpawnEvent event) {
-        if (event.getSpawnReason() == CreatureSpawnEvent.SpawnReason.COMMAND) {
+        if (event.getSpawnReason() == CreatureSpawnEvent.SpawnReason.COMMAND || event.getSpawnReason() == CreatureSpawnEvent.SpawnReason.SPAWNER_EGG) {
             Chunk chunk = event.getLocation().getChunk();
             customSpawns.putIfAbsent(chunk, 0);
             int currentCount = customSpawns.get(chunk);
 
-            if (currentCount >= 300) {
+            if (Bukkit.getRegionTPS(chunk)[0] < 15) {
+            	Bukkit.getLogger().warning("TPS below 15! blocking creatire spawn.");
             	event.getEntity().remove();
                 event.setCancelled(true);
                 return;
@@ -49,7 +50,7 @@ public class Main extends JavaPlugin implements Listener {
 
     @EventHandler
     public void onEntityDeath(EntityDeathEvent event) {
-    	if (event.getEntity().getEntitySpawnReason() == CreatureSpawnEvent.SpawnReason.COMMAND) {
+    	if (event.getEntity().getEntitySpawnReason() == CreatureSpawnEvent.SpawnReason.COMMAND || event.getEntity().getEntitySpawnReason() == CreatureSpawnEvent.SpawnReason.SPAWNER_EGG) {
     		Chunk chunk = event.getEntity().getLocation().getChunk();
             if (customSpawns.containsKey(chunk)) {
                 customSpawns.put(chunk, Math.max(0, customSpawns.get(chunk) - 1));
@@ -72,7 +73,12 @@ public class Main extends JavaPlugin implements Listener {
 
             playerLocations.put(player.getUniqueId(), currentLocation);
 			
-		}, () -> playerLocations.remove(player.getUniqueId()),  1L, 5L);
+		}, () -> playerLocations.remove(player.getUniqueId()),  2L, 5L);
+    	player.getScheduler().runDelayed(this, (spawnTask) -> {
+    		player.teleportAsync(Bukkit.getWorld("world").getSpawnLocation().toCenterLocation());
+    	    player.setRotation(90.0f, 0f);
+    	}, null, 2L);
+    	
     }
 
     /**
