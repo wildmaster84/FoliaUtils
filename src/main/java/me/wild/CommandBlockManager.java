@@ -3,7 +3,9 @@ package me.wild;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Material;
@@ -12,6 +14,7 @@ import org.bukkit.block.BlockFace;
 import org.bukkit.block.BlockState;
 import org.bukkit.block.CommandBlock;
 import org.bukkit.command.BlockCommandSender;
+import org.bukkit.command.CommandException;
 import org.bukkit.craftbukkit.v1_21_R5.block.CraftBlock;
 import org.bukkit.craftbukkit.v1_21_R5.block.CraftBlockEntityState;
 import org.bukkit.event.EventHandler;
@@ -21,7 +24,11 @@ import org.bukkit.event.server.ServerCommandEvent;
 import org.bukkit.metadata.MetadataValue;
 import org.bukkit.plugin.Plugin;
 
+import com.mojang.brigadier.exceptions.CommandSyntaxException;
+
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import net.minecraft.nbt.NBTTagCompound;
 
 public class CommandBlockManager implements Listener {
@@ -62,7 +69,12 @@ public class CommandBlockManager implements Listener {
                 	}
         		}
             	// check if command failed and stop firing if so.
-            	boolean status = processCommandBlock(block, event.getCommand());
+        		CommandBlockOutput status = processCommandBlock(block, event.getCommand());
+        		if (!status.getStatus()) {
+        			repeatingBlocks.remove(block);
+        			task.cancel();
+        			return;
+        		}
             	if (repeatingBlocks.get(block) == null) {
             		processChainCommandBlock(block, new ArrayList<>(), status);
             		repeatingBlocks.put(block, task);
@@ -70,7 +82,8 @@ public class CommandBlockManager implements Listener {
             }, 1L, 1L);
         }
         else if (block.getType() == Material.COMMAND_BLOCK ) {
-        	boolean status = processCommandBlock(block, event.getCommand());
+        	CommandBlockOutput status = processCommandBlock(block, event.getCommand());
+        	if (!status.getStatus()) return;
         	processChainCommandBlock(block, new ArrayList<>(), status);
         }
     }
@@ -79,16 +92,32 @@ public class CommandBlockManager implements Listener {
     // This handles firing the command and tracking the failures.
 	// True -> completed
 	// False -> Command failed
-    private boolean processCommandBlock(Block block, String command) {
-    	List<Block> failedCondition = new ArrayList<>();
+	private CommandBlockOutput processCommandBlock(Block block, String command) {
+		HashMap<String, String> failedCondition = new HashMap<>();
+		failedCondition.put("error", "");
     	Bukkit.getGlobalRegionScheduler().execute(plugin, () -> {
+    		try {
             boolean status = Bukkit.dispatchCommand(Bukkit.getServer().getConsoleSender(), command);
-            if (status == false) failedCondition.add(block);
+            if (status == false) failedCondition.put("error", "Unknown or Invalid command!");
+    		} catch (CommandException e) {
+    			failedCondition.put("error", e.getLocalizedMessage());
+	        }
         });
-    	return failedCondition.contains(block);
+    	Bukkit.getRegionScheduler().execute(plugin, block.getLocation(), () -> {
+            CommandBlock cb = (CommandBlock) block.getState();
+            if (!cb.isPlaced()) return;
+            if (failedCondition.get("error").isEmpty()) {
+            	cb.setSuccessCount(cb.getSuccessCount() + 1);
+            }
+    		Component output = LegacyComponentSerializer.legacySection().deserialize(failedCondition.get("error"));
+			cb.lastOutput(output);
+			cb.update();
+    	});
+
+    	return new CommandBlockOutput((failedCondition.get("error").isEmpty()), failedCondition.get("error"));
 	}
     
-    private void processChainCommandBlock(Block lastBlock, List<Block> history, boolean previousFailed) {
+    private void processChainCommandBlock(Block lastBlock, List<Block> history, CommandBlockOutput output) {
     	Block current =  getNextChainCommandBlock(lastBlock);
     	
     	if (current == null || current.getType() != Material.CHAIN_COMMAND_BLOCK || history.contains(current)) return;
@@ -100,12 +129,12 @@ public class CommandBlockManager implements Listener {
 			return;
 		}
         
-        if (previousFailed && data.isConditional()) {
+        if (output.getStatus() && data.isConditional()) {
         	return;
         }
         
 		history.add(current);
-		boolean status = processCommandBlock(current, command);
+		CommandBlockOutput status = processCommandBlock(current, command);
 		processChainCommandBlock(current, history, status);
     }
 
@@ -120,8 +149,6 @@ public class CommandBlockManager implements Listener {
     public void redstoneChanges(BlockRedstoneEvent e) {
         Block block = e.getBlock();
         BlockState state = block.getState();
-        
-        if (state instanceof CommandBlock) Bukkit.getLogger().warning("Power: " + isCommandBlockAlwaysActive(block));
 
         // If powered for the first time, handle normally
         if (e.getNewCurrent() > 0 && isBlockPowered(block) && !poweredBlocks.contains(block)) {
@@ -146,7 +173,8 @@ public class CommandBlockManager implements Listener {
     
     public boolean isBlockPowered(Block block) {
     	if (block.isBlockPowered() || 
-    			block.isBlockIndirectlyPowered() || isCommandBlockAlwaysActive(block)) return true;
+    			block.isBlockIndirectlyPowered() || 
+    			isCommandBlockAlwaysActive(block)) return true;
     	return false;
     }
     
@@ -166,5 +194,21 @@ public class CommandBlockManager implements Listener {
         }
 
         return false;
+    }
+    
+    private class CommandBlockOutput {
+    	boolean status;
+    	String error;
+    	public CommandBlockOutput(boolean status, String error) {
+    		this.error = error;
+    		this.status = status;
+    	}
+    	
+    	public boolean getStatus() {
+    		return this.status;
+    	}
+    	public String getError() {
+    		return this.error;
+    	}
     }
 }
