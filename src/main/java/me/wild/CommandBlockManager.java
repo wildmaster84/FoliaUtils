@@ -28,6 +28,7 @@ import com.mojang.brigadier.exceptions.CommandSyntaxException;
 
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.TextComponent;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import net.minecraft.nbt.NBTTagCompound;
 
@@ -69,22 +70,26 @@ public class CommandBlockManager implements Listener {
                 	}
         		}
             	// check if command failed and stop firing if so.
-        		CommandBlockOutput status = processCommandBlock(block, event.getCommand());
-        		if (!status.getStatus()) {
-        			repeatingBlocks.remove(block);
-        			task.cancel();
-        			return;
-        		}
-            	if (repeatingBlocks.get(block) == null) {
-            		processChainCommandBlock(block, new ArrayList<>(), status);
-            		repeatingBlocks.put(block, task);
-            	}
+        		processCommandBlock(block, event.getCommand()).thenAccept(result -> {
+            		if (!result.getStatus()) {
+            			repeatingBlocks.remove(block);
+            			task.cancel();
+            			return;
+            		}
+            		if (repeatingBlocks.get(block) == null) {
+                		processChainCommandBlock(block, new ArrayList<>(), result);
+                		repeatingBlocks.put(block, task);
+                	}
+        		});
+            	
             }, 1L, 1L);
         }
         else if (block.getType() == Material.COMMAND_BLOCK ) {
-        	CommandBlockOutput status = processCommandBlock(block, event.getCommand());
-        	if (!status.getStatus()) return;
-        	processChainCommandBlock(block, new ArrayList<>(), status);
+        	
+        	processCommandBlock(block, event.getCommand()).thenAccept(result -> {
+        		if (!result.getStatus()) return;
+        		processChainCommandBlock(block, new ArrayList<>(), result);
+    		});
         }
     }
 
@@ -92,29 +97,47 @@ public class CommandBlockManager implements Listener {
     // This handles firing the command and tracking the failures.
 	// True -> completed
 	// False -> Command failed
-	private CommandBlockOutput processCommandBlock(Block block, String command) {
-		HashMap<String, String> failedCondition = new HashMap<>();
-		failedCondition.put("error", "");
-    	Bukkit.getGlobalRegionScheduler().execute(plugin, () -> {
-    		try {
-            boolean status = Bukkit.dispatchCommand(Bukkit.getServer().getConsoleSender(), command);
-            if (status == false) failedCondition.put("error", "Unknown or Invalid command!");
-    		} catch (CommandException e) {
-    			failedCondition.put("error", e.getLocalizedMessage());
-	        }
-        });
-    	Bukkit.getRegionScheduler().execute(plugin, block.getLocation(), () -> {
-            CommandBlock cb = (CommandBlock) block.getState();
-            if (!cb.isPlaced()) return;
-            if (failedCondition.get("error").isEmpty()) {
-            	cb.setSuccessCount(cb.getSuccessCount() + 1);
-            }
-    		Component output = LegacyComponentSerializer.legacySection().deserialize(failedCondition.get("error"));
-			cb.lastOutput(output);
-			cb.update();
-    	});
+	// This contains a race condition
+	public CompletableFuture<CommandBlockOutput> processCommandBlock(Block block, String command) {
+	    CompletableFuture<CommandBlockOutput> future = new CompletableFuture<>();
 
-    	return new CommandBlockOutput((failedCondition.get("error").isEmpty()), failedCondition.get("error"));
+	    // Run the command on the global scheduler
+	    Bukkit.getGlobalRegionScheduler().execute(plugin, () -> {
+	        String error = "";
+	        try {
+	            boolean status = Bukkit.dispatchCommand(Bukkit.getServer().getConsoleSender(), command);
+	            if (!status) {
+	                error = "Unknown or Invalid command!";
+	            }
+	        } catch (CommandException e) {
+	            error = e.getLocalizedMessage();
+	        }
+	        String finalError = error;
+
+	        // Update the block on the block's region thread
+	        Bukkit.getRegionScheduler().execute(plugin, block.getLocation(), () -> {
+	            if (!(block.getState() instanceof CommandBlock cb)) {
+	                future.complete(new CommandBlockOutput(false, "Not a command block!"));
+	                return;
+	            }
+
+	            if (!cb.isPlaced()) {
+	                future.complete(new CommandBlockOutput(false, "Command block is not placed!"));
+	                return;
+	            }
+
+	            if (finalError.isEmpty()) {
+	                cb.setSuccessCount(cb.getSuccessCount() + 1);
+	            }
+
+	            Component output = LegacyComponentSerializer.legacySection().deserialize(finalError.isEmpty() ? "" : finalError);
+	            cb.lastOutput(output);
+	            cb.update();
+
+	            future.complete(new CommandBlockOutput(finalError.isEmpty(), finalError));
+	        });
+	    });
+	    return future;
 	}
     
     private void processChainCommandBlock(Block lastBlock, List<Block> history, CommandBlockOutput output) {
@@ -128,14 +151,20 @@ public class CommandBlockManager implements Listener {
 		if (command.isEmpty()) {
 			return;
 		}
-        
-        if (output.getStatus() && data.isConditional()) {
-        	return;
+        if (data.isConditional()) {
+        	CommandBlock lastcb = (CommandBlock)lastBlock.getState();
+        	TextComponent text = (TextComponent)lastcb.lastOutput();
+        	if (!lastcb.isPlaced() || !text.content().isEmpty()) {
+        		Bukkit.getLogger().info("Placed: " + lastcb.isPlaced());
+        		Bukkit.getLogger().info("Output: " + text.content());
+        		return;
+        	}
         }
         
 		history.add(current);
-		CommandBlockOutput status = processCommandBlock(current, command);
-		processChainCommandBlock(current, history, status);
+		processCommandBlock(current, command).thenAccept(result -> {
+		    processChainCommandBlock(current, history, result);
+		});
     }
 
     private Block getNextChainCommandBlock(Block block) {
