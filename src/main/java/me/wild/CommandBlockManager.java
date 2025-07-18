@@ -140,32 +140,33 @@ public class CommandBlockManager implements Listener {
 	    return future;
 	}
     
-    private void processChainCommandBlock(Block lastBlock, List<Block> history, CommandBlockOutput output) {
-    	Block current =  getNextChainCommandBlock(lastBlock);
-    	
-    	if (current == null || current.getType() != Material.CHAIN_COMMAND_BLOCK || history.contains(current)) return;
-    	CommandBlock cb = (CommandBlock)current.getState();
-    	 if (!cb.isPlaced()) return;
-    	org.bukkit.block.data.type.CommandBlock data = (org.bukkit.block.data.type.CommandBlock) cb.getBlockData();
-    	String command = (cb.getCommand().isEmpty() ? "" : cb.getCommand().replace("/", ""));
-		if (command.isEmpty()) {
-			return;
-		}
-        if (data.isConditional()) {
-        	CommandBlock lastcb = (CommandBlock)lastBlock.getState();
-        	TextComponent text = (TextComponent)lastcb.lastOutput();
-        	if (!lastcb.isPlaced() || !text.content().isEmpty()) {
-        		Bukkit.getLogger().info("Placed: " + lastcb.isPlaced());
-        		Bukkit.getLogger().info("Output: " + text.content());
-        		return;
-        	}
-        }
-        
-		history.add(current);
-		processCommandBlock(current, command).thenAccept(result -> {
-		    processChainCommandBlock(current, history, result);
-		});
-    }
+	private void processChainCommandBlock(Block lastBlock, List<Block> history, CommandBlockOutput lastOutput) {
+	    Bukkit.getRegionScheduler().execute(plugin, lastBlock.getLocation(), () -> {
+	        Block current = getNextChainCommandBlock(lastBlock);
+	        if (current == null || current.getType() != Material.CHAIN_COMMAND_BLOCK || history.contains(current)) {
+	            return;
+	        }
+
+	        CommandBlock cb = (CommandBlock) current.getState();
+	        if (!cb.isPlaced()) return;
+
+	        String command = cb.getCommand();
+	        if (command.startsWith("/")) command = command.substring(1);
+	        if (command.isEmpty()) return;
+
+	        org.bukkit.block.data.type.CommandBlock data = (org.bukkit.block.data.type.CommandBlock) cb.getBlockData();
+	        if (data.isConditional() && !lastOutput.getStatus()) {
+	            return;
+	        }
+
+	        history.add(current);
+
+	        processCommandBlock(current, command)
+	            .thenAccept(chainResult -> {
+	                processChainCommandBlock(current, history, chainResult);
+	            });
+	    });
+	}
 
     private Block getNextChainCommandBlock(Block block) {
         if (!(block.getState() instanceof CommandBlock)) return null;
